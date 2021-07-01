@@ -1,6 +1,9 @@
+# https://github.com/github/gitignore/blob/master/R.gitignore
+
 # History files
 .Rhistory
 .Rapp.history
+.DS_Store
 
 # Session Data files
 .RData
@@ -37,3 +40,24 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# pkgdown site
+docs/
+
+# translation temp files
+po/*~
+
+# Data files
+Data/
+
+# CSV files
+*.csv
+
+# RDS files
+*.rds
+
+# renv package
+renv/library/
+renv/lock/
+renv/python/
+renv/staging/
