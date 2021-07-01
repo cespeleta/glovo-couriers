@@ -1,0 +1,11 @@
+body .main-container {
+  max-width: 100px;
+}
+
+body {
+  font-size: 14px;
+}
+
+pre {
+  font-size: 13px;
+}

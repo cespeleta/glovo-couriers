@@ -1,0 +1,1769 @@
+---
+title: "Courier Churn Prediction"
+author: "Carlos Espeleta"
+date: "2021-02-16"
+output: 
+  html_notebook:
+    theme: cosmo
+    highlight: textmate
+    css: style.css
+    df_print: paged
+    fig_caption: yes
+    number_sections: true
+    toc: true
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+    code_folding: "none"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE, message = FALSE, echo = FALSE, 
+  fig.align = "center", out.width = "95%", 
+  fig.height = 4, fig.width = 7
+)
+```
+
+```{r load-packages}
+# Load packages
+library(tidyverse)
+library(tidymodels)
+library(patchwork)
+
+# Avoid message on summarise and configure yardstick events
+options(dplyr.summarise.inform = FALSE)
+options(yardstick.event_first = TRUE)
+
+# Set default theme settings
+theme_set(
+  theme_light() +
+    theme(legend.position = "bottom")
+)
+
+# Colors for the target variable
+fill_colors <- c("#E1B378", "#5F9EA0")
+```
+
+```{r knitr-table-aux}
+to_html <- function(df, digits = 2, ...) {
+  knitr::kable(df, format = "html", digits) %>% 
+    kableExtra::kable_styling(
+      bootstrap_options = c("striped", "hover", "condensed"), 
+      ...
+    )
+}
+```
+
+# Executive Summary {.unnumbered}
+
+-   Two datasets have been provided, one with weekly data from 759 couriers and the other one with life time data from 7524 couriers.
+
+-   Multiple analysis has been made in order to understand the data and try to discover what the meaning of each variable is.
+
+-   Different methodologies has been used to impute the missing values, going from mean imputation to to a kNN's.
+
+-   A GLM and Random forest models have been trained on this dataset, achieving an ROC of 0.82 and 0.78 respectively. In order to find the best probability cutoff, threshold optimization has been made.
+
+-   An small business case has been done in order to justify why this threshold has been selected.
+
+# EDA and Data Munging
+
+**In this task, you are being expected to clean data, treat missing values, find out related features and finally label the data. Every courier did not work every week. Thus, some of courier-week combinations' data are not provided. First, come up with a way to treat these missing values. Removing missing values are not suggested since provided data set is small and it will affect your predictive model's evaluation metric. Create a report / dashboard and correlation matrix, in addition to results of your univariate and bivariate analysis and explain your findings. Finally, label your data. If a specific courier's week 9, 10 and 11 data is not provided, we label this courier as "1" otherwise "0". After labeling, remove week 8 (Yes including 8!), 9, 10 and 11 data to avoid bias in your next task. In addition, distribution of feature_3 is a hint how the data is generated.**
+
+## Weekly data
+
+```{r read-weekly-data, echo=TRUE}
+weekly_data <- readr::read_csv(
+  "../data/Courier_weekly_data.csv", 
+  col_types = cols(
+    courier = col_character(), 
+    feature_1 = col_integer(), feature_2 = col_integer(), 
+    feature_3 = col_integer(), feature_11 = col_integer(), 
+    feature_16 = col_integer(), feature_17 = col_integer(), 
+    week = col_integer()) 
+  )
+```
+
+The first thing we must know is with what amount of data we are dealing with. As mentioned above this is an small dataset with `r nrow(weekly_data)` rows and `r ncol(weekly_data)-1` columns.
+
+```{r weekly-data-dim}
+dim(weekly_data)
+```
+
+Another important thing to know is if there are missing values in it and if so, think about how we could treat them. It is interesting to see that the file `Courier_weekly_data.csv` comes without missing values.
+
+```{r weekly-missing-values, rows.print=5, echo=FALSE, eval=FALSE}
+colMeans(is.na(weekly_data))
+```
+
+```{r skimr-weekly-data}
+# Basic statistics report
+my_skim <- skimr::skim_with(
+  numeric = skimr::sfl(n_unique = n_distinct, hist = NULL), 
+  append = TRUE)
+
+skim <- my_skim(weekly_data) %>% 
+  skimr::partition()
+```
+
+How many unique couriers are provided in this data set?
+
+```{r}
+n_distinct(weekly_data$courier)
+```
+
+```{r save-weekly-features}
+weekly_features <- names(weekly_data)
+```
+
+### Descriptive statistics
+
+-   *feature_1* and *feature_2*, *feature_4* and *feature_5*, *feature_8* and *feature_10* have the same number of unique values. They can be the same distribution but with some transformations applied.
+
+-   *feature_2*, *feature_3*, *feature_17* are strictly positive and their minimum value is 1.
+
+-   *feature_4*, *feature_5*, *feature_9* and *feature_14* ranges from 0 to 1.
+
+-   *feature_2* and *feature_3* have similar range of values.
+
+-   *feature_8* and *feature_13* have similar maximum values but in other order of magnitude (\~12.500 vs 12.55)
+
+<!-- * *feature_11* and *feature_12* have similar median. -->
+
+<!-- * *feature_6* has the same mean and median value -->
+
+-   *feature_16* have 11 unique values. Might be a discrete variable.
+
+-   *courier_id*'s have different lengths, there are length of 3, 4 and 5 digits. I would expect them all to have the same length, however they are not and this may be due to the process of exporting the data.
+
+```{r skimr-weekly-data-numbers, echo=TRUE}
+skim %>% 
+  pluck("numeric") %>%
+  to_html(digits = 1)
+```
+
+## Lifetime Value
+
+According to the wikipedia: "Client CLTV is a prediction of the net profit attributed to the entire future relationship with a customer. The prediction model can have varying levels of sophistication and accuracy, ranging from a crude heuristic to the use of complex predictive analytics techniques."
+
+Life time dataset have 3 columns, the *courier_id*, *feature_1* and *feature_2*. There is one row for each courier, with no duplicate id's.
+
+-   *feature_1* is categorical and have four unique values. Don't have missing values
+-   *feature_2* is an integer that can be either positive or negative. Around 12% of the values are missing.
+
+Let's take a look at the dataset
+
+```{r read-ltv-data, echo=TRUE}
+ltv_data <- read_csv(
+  "../data/Courier_lifetime_data.csv", 
+  col_types = cols(
+    courier = col_character(), 
+    feature_1 = readr::col_factor(levels = c("a", "b", "c", "d")) )
+)
+
+head(ltv_data, 3) %>% 
+  to_html(full_width = FALSE)
+```
+
+Dimensions of the dataset
+
+```{r ltv-data-dim}
+dim(ltv_data)
+```
+
+```{r ltv-missing-values, rows.print=5, echo=FALSE, eval=FALSE}
+colMeans(is.na(ltv_data))
+```
+
+Do exist all the courier from `weekly_data` in `ltv_data`?
+
+```{r couriers-in-both-datasets}
+all(unique(weekly_data$courier) %in% ltv_data$courier)
+```
+
+Let's continue our analysis by looking at the life time data of the couriers that are in the weekly data.
+
+How are the couriers distributed? The most representative category of *feature_1* is `a` with 422 couriers and the less one is `c` with only 2 couriers.
+
+```{r ltv-data-distribution, eval=FALSE}
+ltv_data %>%
+  semi_join(weekly_data, by = "courier") %>% 
+  count(feature_1) %>% 
+  to_html(digits = 1, full_width = FALSE)
+```
+
+Do all the missing values belong to the same category of *feature_1*?
+
+-   Categories `a` and `b` have 10% of missing values and categories `c` and `d` have 50% and 20% respectively.
+-   Category `a` contains negative values while `b`, `c` and `d` do not (it is worth mentioning that within the original dataset both categories `a` and `b` contain negative values).
+
+```{r skimr-ltv-data-grouped, echo=FALSE}
+ltv_data %>%
+  semi_join(weekly_data, by = "courier") %>%
+  group_by(feature_1) %>%
+  my_skim() %>%
+  skimr::partition() %>%
+  pluck("numeric") %>%
+  to_html(digits = 1)
+```
+
+```{r base-and-ltv-features}
+ltv_features <- names(ltv_data)
+base_features <- union(weekly_features, paste0(ltv_features[-1], "_ltv"))
+```
+
+## Label your data
+
+Before moving on with the analysis of the data I am going to label the data set because it can be useful for us to identify differences between couriers that have been churned and those that not.
+
+```{r create-labels, echo=TRUE}
+target_df <- weekly_data %>%
+  group_by(courier) %>%
+  summarise(
+    label = if_else(any(c(9, 10, 11) %in% week), "Non_Churn", "Churn")
+  ) %>%
+  ungroup() %>%
+  mutate(label = factor(label, levels = c("Churn", "Non_Churn")))
+```
+
+It is a balanced dataset where 49% (372) of the couriers will not work in any of the last weeks (9, 10, 11) and 51% (387) will work at least in one of them.
+
+```{r display-labels-distribution, fig.width=7, echo=TRUE}
+target_df %>%
+  count(label) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(x = label, y = pct, fill = label)) +
+  geom_col() +
+  geom_label(
+    aes(label = scales::percent(pct, accuracy = 1)), 
+    fill = "white"
+  ) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 0.60)) +
+  scale_fill_manual(values = fill_colors) +
+  labs(
+    title = "Target distribution",
+    x = "", y = ""
+  ) +
+  theme(legend.position = "none")
+```
+```{r save-img-target}
+ggsave(filename = file.path("../figures", "target_distribution.png"), 
+       width = 6, height = 4)
+```
+
+Finally, append this new column `label` to the dataset
+
+```{r add-labels-to-weekly-data, echo=TRUE}
+weekly_data <- weekly_data %>%
+  left_join(target_df, by = "courier")
+```
+
+## Univariate distributions
+
+Here is the code to see all the distributions at once. Instead of that, I have grouped the variables in categories and we will explore them in sub-groups in order to being able to see more details in each of them.
+
+```{r univariate-distributions, fig.height=12, echo=TRUE, eval=FALSE}
+# Show distribution of all variables
+order <- names(weekly_data)[-c(1, 2)]
+weekly_data %>% 
+  select_if(is.numeric) %>%
+  sample_frac(0.5) %>% 
+  pivot_longer(cols = starts_with("feature_")) %>% 
+  mutate(name = fct_relevel(name, order)) %>%
+  ggplot(aes(value), na.rm = TRUE) +
+  geom_histogram(bins = 70, alpha = 0.7, color = "grey30", fill = "white") +
+  facet_wrap(~name, scales = "free", ncol = 3)
+```
+
+### Continious distributions
+
+Some observations taken from this distributions:
+
+-   feature_1 it is centered at cero. It may represent some kind of increase/decrease over weeks.
+-   feature_2 and feature_3 have similar scales, groing from 1 up to around 150 - 200.
+-   feature_3 it is about the double of feature_11
+
+```{r continious-distributions, fig.height = 7.5}
+num_cols <- c(
+  "feature_1", "feature_2", "feature_3", 
+  "feature_6", "feature_10", "feature_11", 
+  "feature_12", "feature_15", "feature_17"
+)
+weekly_data %>% 
+  select(all_of(num_cols)) %>% 
+  # mutate(feature_17 = log1p(feature_17)) %>%
+  pivot_longer(cols = starts_with("feature_")) %>% 
+  mutate(name = fct_relevel(name, num_cols)) %>%
+  ggplot(aes(value)) +
+  geom_rug() +
+  geom_histogram(bins = 100, alpha = 0.7, color = "grey30", fill = "white") +
+  facet_wrap(~name, scales = "free", ncol = 3) +
+  labs(x = "")
+```
+
+```{r save-img-distributions}
+ggsave(filename = file.path("../figures", "continious_distributions.png"), 
+       width = 8, height = 8)
+```
+
+
+### Percentage distributions
+
+This set of distributions have values between 0 and 1 and may represent ratios or percentages. Some ideas that come to my mind are: percentage of orders delivered on-time, customer satifaction of the service received by the courier, courier satisfaction level with glovo, etc.
+
+-   feature_4 and feature_5 seems to be opposite.
+-   feature_4 and feature_7 have similar shape. Most values fall between 0 and 40% with a big spike at 0.
+-   feature_9 and feature_14 have similar shape. It is interesting to see that both distributions have spikes at 50% and 100%.
+
+```{r percentage-distributions, fig.height = 5}
+pct_cols <- c("feature_4", "feature_5", "feature_7", "feature_9", "feature_14")
+weekly_data %>% 
+  select(courier, all_of(pct_cols)) %>% 
+  # mutate(feature_7 = 1 - feature_7) %>% 
+  pivot_longer(cols = starts_with("feature_")) %>% 
+  mutate(name = fct_relevel(name, pct_cols)) %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 70, alpha = 0.7, color = "grey30", fill = "white") +
+  geom_rug() +
+  scale_x_continuous(labels = scales::percent) +
+  facet_wrap(~name, scales = "free_y", ncol = 3) +
+  labs(x = "")
+```
+
+```{r save-img-distributions-pct}
+ggsave(filename = file.path("../figures", "percentage_distributions.png"), 
+       width = 6, height = 4)
+```
+
+### Bi-modal distributions
+
+It can also been observed that *feature_8* and *feature_13* have bi-modal distributions. It is colored with a dashed red line the valley between both modes. The values that fall on the right side of the black line might be considered outliers.
+
+It's interesting that *feature_8* appears to be 1000 times larger than *feature_13* in order of magnitude, i.e, the maximum value of *feature_8* is 12.500 while in *feature_13* is 12.5.
+
+```{r bimodal-distributions, fig.height = 3.5}
+# - If we multiply feature_13 * 1000 they have the similar range of values
+# - Maximum values is 12.500
+p1 <- weekly_data %>% 
+  select(feature_8) %>% 
+  ggplot(aes(feature_8)) +
+  geom_histogram(bins = 100, color = "grey30", fill = "white") +
+  geom_rug() +
+  geom_vline(xintercept = c(2900, 3400, 9048), color = "red", lty = "dashed") +
+  geom_vline(xintercept = c(9048), color = "black", lty = "dashed") +
+  labs(title = "feature_8", x = "")
+
+p2 <- weekly_data %>% 
+  select(feature_13) %>% 
+  # mutate(feature_13 = feature_13 * 1000) %>% 
+  ggplot(aes(feature_13)) +
+  geom_histogram(bins = 100, color = "grey30", fill = "white") +
+  geom_rug() +
+  geom_vline(xintercept = c(4.4, 4.6), color = "red", lty = "dashed") +
+  geom_vline(xintercept = c(9.4), color = "black", lty = "dashed") +
+  labs(title = "feature_13", x = "", y = "")
+
+p1 + p2
+```
+
+```{r save-img-distributions-percentage}
+ggsave(filename = file.path("../figures", "bimodal_distributions.png"), 
+       width = 6, height = 4)
+```
+
+```{r}
+# weekly_data %>% 
+#   select(courier, label, feature_8, feature_13) %>% 
+#   mutate(feature_8 = feature_8 / 1000) %>% 
+#   group_by(courier, label) %>% 
+#   summarise_all(mean) %>% 
+#   ggplot(aes(feature_13, feature_8, color = label)) +
+#   geom_point()
+```
+
+### Discrete distributions
+
+This imbalanced nature can cause problems in future analytic models so it may make sense to combine these infrequent levels into an "other" category. The only way to know if this encoding improves the model performance is trying it out.
+
+```{r discrete-distributions, fig.height = 4}
+p1 <- weekly_data %>%
+  count(feature_16) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(reorder(feature_16, -n), n)) +
+  geom_col(alpha = 1, color = "grey30", fill = "white") +
+  labs(
+    title = "Raw feature_16",
+    subtitle = "No processing applied",
+    x = "feature_16",
+    y = "count"
+  )
+
+p2 <- weekly_data %>% 
+  mutate(feature_16 = fct_lump(as_factor(feature_16), n = 6)) %>% 
+  count(feature_16) %>%
+  mutate(pct = n / sum(n)) %>%
+  ggplot(aes(reorder(feature_16, -n), n)) +
+  geom_col(alpha = 1, color = "grey30", fill = "white") +
+  labs(
+    title = "Encoded feature_16", 
+    subtitle = "Low frequency cat. encoded as `other`",
+    x = "feature_16",
+    y = ""
+  )
+
+print(p1 + p2)
+```
+
+### Correlation matrix
+
+Sometimes we have multiple predictors that are highly correlated between them. We do not want to keep all this variables if all are explaining us the same thing. Removing highly correlated variables will led us with a simplified version of the model.
+
+-   *feature_4* and *feature_5* are the same feature, they have a correlation -1
+-   *feature_2* and *feature_3* have a correlation of 0.79.
+-   *feature_3* and *feature_11* have a correlation of 0.86
+
+```{r correlation-matrix-plot, fig.height=7, fig.width=10, echo=TRUE}
+col <- colorRampPalette(
+  c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+
+weekly_data %>% 
+  select(label, starts_with("feature") & !ends_with("ltv")) %>% 
+  mutate(label = as.integer(label) - 1L) %>% 
+  # sample_frac(0.8) %>% 
+  cor(method = "pearson") %>%
+  corrplot::corrplot(
+    method = "color", col = col(100),  
+    type = "lower",
+    # Add coefficient of correlation
+    addCoef.col = "black",
+    number.font = 2, number.digits = 2, number.cex = 0.8,
+    # Text label color and rotation
+    tl.col = "black", tl.srt = 45, tl.cex = 0.9, 
+    diag = FALSE 
+  )
+```
+
+## Multivariate analysis {#multivariate-analysis}
+
+So far, a univariate analysis has been explored. Now is time to see what relationships have the features between them.
+
+During the discovering phase the `ggpairs` function from the `GGally` has been used to visualize scatter plots for each pair of variables. This scatter plots has been colored by `label` (Churn and Non_Churn) with the objective to find patterns. Furthermore, data aggregated by courier and week has been analyzed too, but to do not make the report too long only some of the visualizations will be shown.
+
+An example of the code used is:
+
+```{r example-ggally, eval=FALSE, echo=TRUE}
+library(GGally)
+weekly_data %>% 
+  sample_frac(0.25) %>% 
+  GGally::ggpairs(
+    columns = c(paste0("feature_", c(1, 2, 3, 5, 9, 11, 14))), 
+    progress = FALSE,
+    lower = list(combo = wrap("facethist", bins = 50)),
+    mapping = ggplot2::aes(color = label))
+```
+
+Couriers that have churned have, on average, lower values than those that do not. This are potential features to be used in our model.
+
+```{r, fig.height = 3.5}
+cols <- c("feature_2", "feature_3", "feature_11")
+weekly_data %>% 
+  left_join(ltv_data, by = "courier", suffix = c("", "_ltv")) %>% 
+  select(courier, label, feature_1_ltv, all_of(cols)) %>% 
+  group_by(courier, label, feature_1_ltv) %>% 
+  summarise_if(is.numeric, mean) %>% 
+  pivot_longer(cols = starts_with("feature") & -c(feature_1_ltv, label)) %>% 
+  mutate(name = factor(name, levels = cols)) %>% 
+  ggplot(aes(label, value, fill = label)) +
+  geom_boxplot() +
+  facet_wrap(~name, ncol = 3) +
+  scale_fill_manual(values = fill_colors) +
+  theme(legend.position = "none") +
+  labs(x = "")
+```
+
+There are also features that have some kind of relationship between them, for example there is an straight line in the plot of *feature_1* vs *feature_2* indicating us that does not exist values of *feature_2* below *feature_1* when *feature_1* is negative. Another example is *feature_4* and *feature_14*, where all the values falls below the diagonal line (similar with *feature_9*).
+
+After playing with this features a bit I've realized that *feature_4* + *feature_14* have values between $\left[0, 1\right]$.
+
+```{r, fig.height = 4}
+cols <- c("feature_8", "feature_13", "feature_1_ltv")
+p1 <- weekly_data %>% 
+  select(courier, label, feature_1, feature_2) %>% 
+  ggplot(aes(feature_1, feature_2)) +
+  geom_point(alpha = 0.1) +
+  geom_vline(xintercept = 0, color = "darkorange", linetype = 2) 
+
+p2 <- weekly_data %>% 
+  select(courier, label, feature_4, feature_14) %>% 
+  ggplot(aes(feature_4, feature_14)) +
+  geom_point(alpha = 0.1) +
+  geom_abline(slope = -1, intercept = 1, linetype = 2, color = "darkorange") +
+  theme(legend.position = "none")
+
+p1 + p2
+```
+```{r img_feature_1_vs_feature_2_and_feature_4}
+ggsave(filename = file.path("../figures", "multivariate_analysis_1.png"), 
+       width = 6, height = 4)
+```
+
+Another interesting relationship is feature_3 with feature_5 (or feature_9) where a kind of `log` lines can be seen.
+
+```{r, fig.height = 3.5}
+cols <- c("feature_3", "feature_5")
+weekly_data %>% 
+  select(courier, label, all_of(cols)) %>%
+  # filter(feature_5 < 1) %>% 
+  ggplot(aes(feature_3, feature_5)) +
+  geom_point(alpha = 0.1) +
+  # geom_vline(xintercept = 118, color = "darkorange", linetype = 2) +
+  facet_wrap(~label, ncol = 2) +
+  theme(legend.position = "none")
+```
+
+<!-- At the beginning of this notebook we have seen that feature_2 from Courier_lifetime_data file comes with 12% of missing values. We would like to impute them in order to get the full picture. -->
+
+Most features have similar values for the different categories of the `feature_1` from the `Courier_lifetime_data` file but, however, `feature_8` and `feature_13` show differences between groups.
+
+```{r, fig.height = 3.5}
+cols <- c("feature_8", "feature_13", "feature_1_ltv")
+weekly_data %>% 
+  left_join(ltv_data, by = "courier", suffix = c("", "_ltv")) %>% 
+  select(courier, all_of(cols)) %>% 
+  pivot_longer(cols = starts_with("feature") & -feature_1_ltv) %>%
+  mutate(name = factor(name, levels = cols)) %>% 
+  ggplot(aes(feature_1_ltv, value, fill = feature_1_ltv)) +
+  geom_boxplot(alpha = 0.8) +
+  facet_wrap(~name, scales = "free", ncol = 3) +
+  scale_fill_brewer(palette = "Dark2", direction = 1) +
+  theme(legend.position = "none")
+```
+
+## Weeks worked {#weeks-worked}
+
+We see that there is a relationship between the number of days worked and the probability of churn. For example, only 14% of the couriers who have worked one week have worked again in weeks 9, 10 or 11, however, 87% of those who have worked 8 weeks have worked again in the upcoming weeks.
+
+```{r viz-weeks-worked, fig.height=5}
+weekly_data %>% 
+  filter(week < 8) %>%
+  count(courier, label) %>% 
+  count(n, label, name = "nn") %>% 
+  group_by(n) %>% 
+  mutate(pct = nn / sum(nn)) %>% 
+  group_by(label) %>% 
+  mutate(text_pos = if_else(label == "Non_Churn", 0.05, 0.95)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = factor(n), y = pct, fill = label)) +
+  geom_bar(stat = "identity", position = "fill") +
+  geom_text(
+    aes(
+      y = text_pos, 
+      label = scales::percent(pct, accuracy = 0.1)
+    ), 
+    size = 4, color = "white"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(
+    title = "How many weeks work the couriers?", 
+    subtitle = "Training data: weeks from 1 to 8",
+    x = "Weeks worked", y = ""
+  ) +
+  scale_fill_manual(values = fill_colors)
+```
+
+```{r expot_img_weeks_worked}
+ggsave(filename = file.path("../figures", "weeks_worked.png"), 
+       width = 8, height = 6)
+```
+
+## Retention rate
+
+Customer (courier in this case) retention is a very useful metric to understand how many of the all couriers are still active. <!-- Imagine that we push a notification when couriers reach their 3th week working for Glovo. We would expect that some couriers would be engaged again and then we would expect some sort of spike around the 3th week. -->
+
+```{r retention-rate-table}
+retention_rate <- weekly_data %>%
+  select(courier, week) %>%
+  group_by(courier) %>%
+  mutate(
+    start_week = min(week),
+    index = paste0("W_", week - start_week)
+  ) %>%
+  group_by(start_week, index) %>%
+  summarise(n = n_distinct(courier)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = index, values_from = n) %>%
+  select(start_week, all_of(paste0("W_", seq(0, 11))))
+
+# head(retention_rate, 12)
+```
+
+```{r retention-rate-pct}
+retention_pct <- retention_rate %>%
+  mutate_at(
+    vars(starts_with("W")),
+    .funs = ~ .x / retention_rate$W_0
+  )
+```
+
+We see that usually more than half of the newly registered couriers stop working the following week. We should take actions to make the first week more enjoyable and make people want to continue working as a courier.
+
+```{r retention-rate-plot, fig.height=5}
+lvls <- paste0("W_", seq(0, 11))
+retention_pct %>%
+  pivot_longer(cols = starts_with("W")) %>%
+  mutate(
+    start_week = factor(start_week, labels = lvls) %>% fct_rev(),
+    name = factor(name, levels = lvls)
+  ) %>%
+  ggplot(aes(x = name, y = start_week, fill = value)) +
+  geom_tile(color = "white") +
+  # geom_text(aes(label = value), color = "black") +
+  geom_text(aes(label = scales::percent(value, accuracy = 2)), color = "black") +
+  scale_fill_gradient(low = "white", high = "darkgreen", na.value = "white") +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  theme(legend.position = "none") +
+  labs(x = "# weeks working at Glovo!")
+```
+
+```{r expot_img_retention_rate}
+ggsave(filename = file.path("../figures", "retention_rate.png"), 
+       width = 6, height = 6)
+```
+
+
+```{r, fig.height=5, eval=FALSE}
+retention_pct %>% 
+  pivot_longer(cols = starts_with("W")) %>%
+  mutate(
+    start_week = factor(start_week, labels = lvls) %>% fct_rev(),
+    name = factor(name, levels = lvls)
+  ) %>%
+  ggplot(aes(x = name, y = value, group = start_week, color = start_week)) +
+  geom_point() +
+  geom_line() +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(y = "Percent Survived (%)")
+```
+
+## Find distribution of feature_3
+
+**In addition, distribution of *feature_3* is a hint how the data is generated.**
+
+It is a discrete distribution because all values are integers. It has a mean = `r round(mean(weekly_data$feature_3), 1)` and variance = `r round(var(weekly_data$feature_3), 1)`. The first distributions that come to my mind are the Poisson and the Negative Binomial distribution.
+
+```{r viz-feature_3}
+# Feature 3: Count data. Data has been generated using this distribution
+ggplot(weekly_data, aes(feature_3)) +
+  geom_histogram(bins = 100, color = "grey30", fill = "white") +
+  labs(title = "feature_3", x = "")
+```
+
+### Poisson distribution
+
+Simply looking at this plots we can see how the Poisson distribution does not fit correctly the data. The Poisson distribution assumes that the mean and the variance are equal (or similar) and that's not the case.
+
+```{r poisson-distribution, echo=TRUE}
+x <- weekly_data %>% pull(feature_3)
+fit <- fitdistrplus::fitdist(x, "pois", discrete = TRUE)
+plot(fit)
+```
+
+### Negative Binomial distribution
+
+In contrast, the negative binomial distribution can be used for over-dispersed count data, that is when the variance exceeds the mean. It has the same mean structure as a Poisson and it has an extra parameter to model the over-dispersion. Now looks much better!
+
+```{r neg-binomial-distribution, echo=TRUE}
+fit_nbinom <- fitdistrplus::fitdist(x, "nbinom", discrete = TRUE)
+plot(fit_nbinom)
+```
+
+```{r gamma-distribution, eval=FALSE}
+# Gamma distribution
+fit_gamma <- fitdistrplus::fitdist(x, "gamma", discrete = TRUE)
+plot(fit_gamma)
+gofstat(fit_gamma)
+
+# Negative binomial has lower AIC -> it's our distribution
+gofstat(list(fit_nbinom, fit_gamma))
+```
+
+Despite I think that the distribution behind the feature_3 is the negative binomial I have not found the way to take advantage of it. I've been reading through internet and I have found that sometimes the [Pareto/NBD](https://www.jstor.org/stable/2631608?seq=1) model is used to calculate client life time value, but to be honest I have never used it.
+
+## Data cleaning
+
+During the analysis of the dataset we have seen some data points that fall in the extremes of the distributions. This kind of values doesn't appear frequently and it is worth identify them and analyze why they are happening. When dealing with outliers we also must take care to not being too restrictive when clipping their values or we can even lose information.
+
+Exist multiple methods to detect outliers, some of them are: use *zscore* to identify those points that are far away from the sample's mean or use quantiles to identify the points that lie above/below some percent of the data. There also exist more advanced methods that use multiple variables and not only the variable itself to detect outliers. Some of them are kNN (based on distances) or dbscan (based on densities).
+
+For this exercise I have taken the decision of cleaning the values manually because I just wanted to clean few data points to not loss too much information.
+
+```{r clean-data-manual, echo=TRUE}
+weekly_data_clean <- weekly_data %>% 
+  mutate(
+    feature_1 = replace(feature_1, feature_1 < -91, -91),
+    feature_2 = replace(feature_2, feature_2 > 146, 146),
+    feature_3 = replace(feature_3, feature_3 > 175, 175),
+    feature_4 = replace(feature_4, feature_4 > 0.5, 0.5),
+    feature_5 = replace(feature_5, feature_5 < 0.5, 0.5),
+    feature_6 = replace(feature_6, feature_6 > 150, 150),
+    feature_6 = replace(feature_6, feature_6 < 100, 100),
+    feature_7 = replace(feature_7, feature_7 > 0.4, 0.4),
+    feature_8 = replace(feature_8, feature_8 > 9000, 9000),
+    feature_12 = replace(feature_12, feature_12 > 50, 50),
+    feature_13 = replace(feature_13, feature_13 > 10, 9.34),
+    feature_15 = replace(feature_15, feature_15 > 121.63, 121.63),
+    feature_16 = replace(feature_16, feature_16 > 10, 10),
+    feature_17 = replace(feature_17, feature_17 > 100, 100)
+  )
+```
+
+For the life time data I have clipped negative values of feature_2 with category *a* to 0 and for category *c* to 24 because we just have two samples with `feature_1 == 'c'` and it's value is 24.
+
+```{r clean-ltv-manual, echo=TRUE}
+ltv_data_clean <- ltv_data %>% 
+  semi_join(weekly_data, by = "courier") %>% 
+  mutate(
+    feature_2 = replace(feature_2, feature_1 == "a" & feature_2 < 0, 0),
+    feature_2 = replace(feature_2, feature_1 == "c", 24)
+  ) %>% 
+  ungroup()
+```
+
+## Complete data frame
+
+As pointed out in the statement, some courier-week are not provided in this dataset. Before completing the data frame an indicator of missigness will be added.
+
+```{r indicator-missigness, echo=TRUE}
+weekly_data_clean <- weekly_data_clean %>% 
+  mutate(is_missing = 0L)
+```
+
+To complete the data frame I will use the function `crossing` from the package `tidyr`. Then, I will append all the information from `weekly_data` and `ltv_data` using `left_join`'s.
+
+```{r complete-df, echo=TRUE}
+weekly_data_complete <- weekly_data_clean %>% 
+  with(crossing(courier = courier, week = week)) %>% 
+  left_join(weekly_data_clean, by = c("courier", "week")) %>% 
+  left_join(ltv_data_clean, by = c("courier"), suffix = c("", "_ltv")) %>% 
+  # Replace missing values on our indicator
+  mutate(is_missing = replace_na(is_missing, 1L))
+
+dim(weekly_data_complete)
+```
+
+```{r append-target}
+weekly_data_complete <- weekly_data_complete %>% 
+  select(-label) %>% 
+  left_join(target_df, by = "courier")
+```
+
+How many missing observations do we have? Around 55%
+
+```{r num-real-observations}
+round(prop.table(table(weekly_data_complete$is_missing)), 2)
+```
+
+## Impute missing data
+
+Now that we have completed the data frame a set of empty rows has been added to our data frame. When we have few missing values we can take the decision of remove those rows but in this case missing values represent 55% of the data.
+
+Exist multiple ways of treat missing values, going from univariate methods to multivariate ones. Univariate methods are easier to apply but they does not take advantage of the rest of the variables provided, i.e mean, median or random imputation. In contrast, multivariate methods are more sophisticated and require to develop a model to work.
+
+```{r viz-missing-values, fig.height=5}
+visdat::vis_miss(
+  weekly_data_complete %>% arrange(week), 
+  cluster = FALSE, show_perc = FALSE )
+```
+
+### feature_2\_ltv
+
+In the case of `feature_2_ltv` we can impute the values using a model because this feature is constant for every courier in every week and we have at least one observation per courier.
+
+In order to keep things simple I will impute `feature_2_ltv` with `feature_8`, `feature_13` and `feature_1_ltv` using a *kNN*. Of course, it would be a good idea to use a cross validation schema to see which variables perform better and to tune the hyperparameter *neighbors*.
+
+```{r}
+tmp <- weekly_data_clean %>% 
+  group_by(courier) %>% 
+  summarise_if(is.numeric, mean) %>% 
+  ungroup() %>% 
+  left_join(ltv_data_clean, by = "courier", suffix = c("", "_ltv"))
+```
+
+```{r impute-feature_2_ltv, echo=TRUE}
+index <- which(is.na(tmp$feature_2_ltv))
+rr <- recipe(feature_2_ltv ~ courier + feature_8 + feature_13 + feature_1_ltv, 
+             data = tmp) %>% 
+  update_role(courier, new_role = "id") %>% 
+  step_dummy(feature_1_ltv, one_hot = TRUE) %>% 
+  step_normalize(feature_8, feature_13) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_knnimpute(feature_2_ltv, neighbors = 5) %>% 
+  prep(training = tmp) %>% 
+  juice()
+```
+
+```{r viz-imputed-values}
+ggplot() +
+  geom_histogram(
+    data = rr[-index, ], 
+    aes(feature_2_ltv), fill = "#E69F00", alpha = 0.7, bins = 50
+  ) +
+  geom_histogram(
+    data = rr[index, ],
+    aes(feature_2_ltv), fill = "#56B4E9", alpha = 0.7, bins = 50
+  )
+```
+
+### feature_1 and feature_2
+
+`feature_1` and `feature_2` are features that goes hand in hand as we have seen during the [multivariate analysis](#multivariate-analysis). After spending some time looking at the data I have realized that `feature_1` + `feature_2` is the value of `feature_2` for the next week. That is, `feature_1` is the *score* of each week and `feature_2` is the accumulated value over the previous weeks.
+
+In the example below, on week 7 all values are missing. However, we can re-build them by adding the values of both features 1 and 2. That is, the missing value of `feature_2` is 157 (146 + 11). Also, applying the same procedure but in the opposite direction we can find out the value of the `feature_1` (-20).
+
+```{r example-f1-f2-reconstruction}
+weekly_data_complete %>%
+  filter(courier == "119103") %>%
+  filter(between(week, 5, 9)) %>% 
+  select(courier:feature_2) %>%
+  mutate(
+    feature_2_mod = lag(feature_1 + feature_2),
+    feature_1_mod = lead(feature_2) - feature_2_mod,
+  ) %>% 
+  head(12) %>% 
+  to_html(digits = 0)
+```
+
+Another interesting thing is that when `-feature_1 == feature_2` the courier will not work next week. In the example below we see that the courier works on week 0 and 1 but not in week 2. The same happens with week 5.
+
+```{r example-next-week-not-work}
+weekly_data_complete %>% 
+  select(courier:feature_6) %>% 
+  filter(courier == "146869") %>% 
+  head(7) %>% 
+  to_html(digits = 2)
+```
+
+```{r impute-missings-of-f1-and-f2}
+weekly_data_complete <- weekly_data_complete %>%
+  # filter(courier == "119103") %>%
+  # select(courier:feature_2) %>%
+  group_by(courier) %>% 
+  mutate(
+    feature_2_mod = lag(feature_1 + feature_2),
+    feature_2 = if_else(is.na(feature_2), feature_2_mod, feature_2),
+    feature_1_mod = lead(feature_2) - feature_2,
+    feature_1 = if_else(is.na(feature_1), feature_1_mod, feature_1)
+  ) %>% 
+  ungroup() %>% 
+  select(-c(feature_1_mod, feature_2_mod))
+```
+
+### Other variables
+
+We cannot do the same to impute weekly data because when we have missing values they are for all the variables and hence we cannot use the rest of predictors to fill in the blanks.
+
+```{r show-missing-all-features}
+weekly_data_complete %>% 
+  filter(courier == "10622") %>% 
+  select(courier:feature_6) %>% 
+  head(5) %>% 
+  to_html(digits = 2)
+```
+
+As a demonstration of how different methods impute the data, here I will impute `feature_3` using mean and random imputation.
+
+```{r aux-function-plot-imputed-values}
+# Impute mean value
+plot_imputed_hist <- function(weekly_data_complete, imputed, var = NULL) {
+  ggplot() +
+    geom_histogram(
+      data = weekly_data_complete, aes(!!sym(var)), 
+      fill = "#E69F00", bins = 30, alpha = 0.3, na.rm = TRUE
+    ) +
+    geom_histogram(
+      data = imputed, aes(!!sym(var)), 
+      fill = "#56B4E9", bins = 30, alpha = 0.3, na.rm = TRUE
+    )
+}
+```
+
+Here is the code to impute missing values using the `recipes` package.
+
+```{r mean-imputation, echo=TRUE}
+index <- which(is.na(weekly_data_complete$feature_3))
+
+# Mean imputation recipe
+mean_juiced <- 
+  recipe( ~ ., data = weekly_data_complete) %>%
+  update_role(courier, new_role = "id variable") %>% 
+  step_meanimpute(feature_3) %>%
+  prep(training = weekly_data_complete) %>%
+  juice()
+
+# Imputed values using mean
+mean_impute <- mean_juiced[index, ]
+
+p1 <- weekly_data_complete %>% 
+  plot_imputed_hist(mean_impute, "feature_3") +
+  labs(title = "Mean Imputation")
+```
+
+With the function `random_imp` we can impute at random, that is, first we identify which observations are missing and then we impute them using a random selection (using the `sample` function) of the values of the variable.
+
+```{r random-imputation, echo=TRUE}
+random_imp <- function(x) {
+  missing <- is.na(x)
+  n_missing <- sum(missing)
+  x_obs <- x[!missing]
+  imputed <- x
+  imputed[missing] <- sample(x_obs, n_missing, replace = TRUE)
+  return(imputed)
+}
+
+# Imputed values with random imputation
+random_impute <- weekly_data_complete %>% 
+  mutate(feature_3 = random_imp(feature_3)) %>% 
+  slice(index)
+
+p2 <- weekly_data_complete %>% 
+  plot_imputed_hist(random_impute, "feature_3") +
+  labs(title = "Random Imputation")
+```
+
+We can compare how different the distribution of the `feature_3` is if we use one method or the other to impute the values. On the left side the mean has been used, that is the value used to impute the missing values is always constant, plotted in blue. On the right side, random imputation has been used instead. Despite this methods does neither take into account the rest of the variables nor the restrictions that they may have (e.g. feature_1 vs feature_2) the overall distribution looks like the original.
+
+```{r show-differences-between-methods}
+p1 + p2
+```
+
+Finally, impute values on all the features of the dataset using random imputation.
+
+```{r impute-all-variables, echo=TRUE}
+# Impute values using random_imputation
+weekly_data_imputed <- weekly_data_complete %>% 
+  mutate_all(random_imp)
+```
+
+It is possible create a recursive function that impute values and verifies if some conditions are met, for instance, `feature_4` + `feature_14` \<= 1. If the conditions is not met try it again until the imputed values met that condition.
+
+```{r show-imputed, eval=FALSE}
+random_impute <- weekly_data_imputed %>% 
+  slice(index)
+
+weekly_data_imputed %>% 
+  mutate(is_missing = ifelse(is_missing, "Imputed", "Original")) %>% 
+  ggplot(aes(is_missing, feature_3, fill = is_missing)) +
+  geom_boxplot(alpha = 0.7, na.rm = TRUE) +
+  labs(
+    title = "Original data vs imputed data"
+  )
+```
+
+## Courier distribution
+
+Before to start modeling, let's see how the couriers are distributed between train and test datasets.
+
+```{r train-test-couriers, echo=TRUE}
+train_couriers <- weekly_data %>% 
+  filter(week < 8) %>% 
+  pull(courier) %>% 
+  unique()
+
+test_couriers <- weekly_data %>% 
+  filter(week > 8) %>% 
+  pull(courier) %>% 
+  unique()
+```
+
+-   `r sum(!train_couriers %in% test_couriers)` couriers from the training data do not exist on the testing data
+
+-   `r sum(!test_couriers %in% train_couriers)` couriers from the testing data do not exist on the training data
+
+There are 22 couriers that only exist on the testing data meaning that we do not have real information about them to train the model. This couriers might be:
+
+-   Couriers that have not worked during the previous 8 weeks.
+-   New couriers that have recently joined glovo.
+
+This is important because it is telling us that we cannot use the courier identifier within the model or it will not generalize on new couriers.
+
+```{r only-in-test, echo=FALSE}
+only_in_test <- test_couriers[!test_couriers %in% train_couriers]
+```
+
+# Predictive algorithm
+
+**In your second task, you were expected to create a model that classifies your labels that done in the first task. Create a model by using Python or R. You are free to choose your algorithm and libraries / packages to use.**
+
+## Data splitting
+
+Initial split of the data frame within train and test.
+
+```{r data-splitting, echo=TRUE}
+train <- weekly_data_imputed %>% 
+  select(-feature_5) %>%                  # Drop feature 5
+  filter(!courier %in% only_in_test) %>%  # Not use couriers only test
+  filter(week < 8)                        # Select desired weeks
+
+test <- weekly_data_imputed %>% 
+  select(-feature_5) %>%
+  filter(week > 8)
+```
+
+As seen during the analysis, features such as `weeks_worked` seems that may help the model to identify couriers that will churn. Note that this features are calculated using only train data to not introduce leakage.
+
+```{r agg-features, echo=TRUE}
+by_courier <- train %>% 
+  group_by(courier) %>% 
+  summarise(
+    weeks_worked = sum(is_missing == 0),
+    time_to_rest = sum(-feature_1 == feature_2)
+  ) %>% 
+  ungroup()
+```
+
+```{r agg-features-check}
+# unique(by_courier$weeks_worked)
+# unique(by_courier$time_to_rest)
+```
+
+Append new features to train and test
+
+```{r add-agg-features, echo=TRUE}
+train <- train %>% 
+  left_join(by_courier, by = "courier") 
+  # replace_na(list(weeks_worked = 0, time_to_rest = 0))
+
+test <- test %>% 
+  left_join(by_courier, by = "courier")
+  # replace_na(list(weeks_worked = 0, time_to_rest = 0))
+```
+
+### Cross validation
+
+Rather than simply train our model in one part of the data I will use a cross validation schema in order to get a more reliable measure of the performance of the model. In this case, a `group_v_fold` has been chosen, that is in each fold we will train our model on a set of couriers and we will evaluate it in another set with unseen couriers.
+
+```{r create-folds, echo=TRUE}
+set.seed(443)
+folds <- group_vfold_cv(train, group = courier, v = 10)
+```
+
+How many couriers does contains each fold? Within each fold there are aprox. 663 couriers for train and 74 to evaluate the model.
+
+```{r show-couriers-folds}
+get_n_couriers <- function(x, set = "train") {
+  if (set == "train") {
+    return(n_distinct(training(x)$courier))
+  } else if (set == "valid"){
+    return(n_distinct(assessment(x)$courier))
+  }
+}
+
+# Courier in each split
+data.frame(
+  "fold"  = folds$id,
+  "train" = map_int(folds$splits, get_n_couriers, set = "train"),
+  "valid" = map_int(folds$splits, get_n_couriers, set = "valid") 
+  ) %>% 
+  to_html(full_width = FALSE)
+```
+
+## Modeling
+
+Despite this is a balanced dataset and I could choose `accuracy` to evaluate the model I will use `roc_auc` instead, because it is an overall assessment of performance across cutoffs. It is often recommended analyze the values of the `roc_auc` together with `precision_recall` because when dealing with high imbalanced datasets the `roc_auc` can be misleading because of the true negatives.
+
+```{r define-metrics}
+prob_metrics <- metric_set(roc_auc, pr_auc)
+
+ctrl <- control_resamples(
+  save_pred = TRUE, 
+  allow_par = FALSE,
+  extract = extract_model
+)
+```
+
+### Dummy Model
+
+This classifier is used as a simple baseline to compare with other classifiers. In classification problems it predicts either the majority class or the frequency of the label.
+
+```{r dummy-model, echo=TRUE}
+null_model <- null_model(mode = "classification") %>%
+  set_engine("parsnip") %>% 
+  fit(label ~ ., data = train %>% select(label))
+
+null_model_preds <- 
+  predict(null_model, test, type = "prob") %>% 
+  bind_cols(test)
+
+null_model_metrics <- null_model_preds %>% 
+  prob_metrics(label, .pred_Churn)
+  
+sprintf("Null model ROC: %.2f - PR: %.2f", 
+        null_model_metrics$.estimate[1], 
+        null_model_metrics$.estimate[2])
+```
+
+### Logistic regression
+
+Logistic regression is a model that uses a logistic function to model a binary dependent variable. When using a sigmoid function to convert log-odds to probabilities we say that we are using a logistic model.
+
+```{r basic-recipe, echo=TRUE}
+# to_rm <- setdiff(names(train), c(base_features, "label"))
+basic_rec <- recipe(label ~ ., data = train) %>%
+  update_role(courier, new_role = "id") %>%
+  step_medianimpute(weeks_worked, time_to_rest) %>% 
+  step_rm(is_missing, weeks_worked, time_to_rest)
+```
+
+The following steps will be used:
+
+-   Normalize (center and scale) all numeric variables
+-   Create a model definition
+-   Create a workflow that merges the preprocessing steps and the model
+-   Evaluate the workflow on the resamples
+-   Collect the metrics
+
+```{r simple-glm, echo=TRUE}
+# Basic recipe that just normalizes the data
+rec_glm <- basic_rec %>% 
+  step_normalize(all_numeric())
+
+# Define glm model
+glm_model <- logistic_reg(mode = "classification") %>%
+  set_engine("glm")
+
+# Create workflow
+glm_wf <- workflow() %>% 
+  add_model(glm_model) %>% 
+  add_recipe(rec_glm)
+
+# Train on folds
+glm_fit_rs <- glm_wf %>% 
+  fit_resamples(folds, metrics = prob_metrics, control = ctrl)
+
+# Summarized results
+collect_metrics(glm_fit_rs, summarize = TRUE) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
+
+Let's try to improve this first model adding some pre-processing steps:
+
+-   Transform numeric variables to a more gaussian-like distribution using `YeoJhonson` transformation
+-   Create dummy variables of `feature_1_ltv`
+-   Remove all variables that have near zero variance.
+
+```{r glm-preprocess2l, echo=TRUE}
+rec_glm_2 <- basic_rec %>% # rec_glm
+  step_YeoJohnson(all_numeric()) %>%
+  step_dummy(feature_1_ltv, one_hot = TRUE) %>%
+  step_nzv(all_predictors())
+```
+
+Before moving forward, how the dataset looks like after the preprocess?
+
+```{r viz-prepped-df}
+# Visualize how the is the pre-processed data frame
+prep(rec_glm_2, train) %>% 
+  juice() %>% 
+  select(courier:feature_4, contains("feature_1_ltv")) %>% 
+  head(3) %>% 
+  to_html(digits = 2)
+```
+
+Evaluate the model
+
+```{r glm-model2}
+# Update the workflow with the new recipe
+glm_wf <- glm_wf %>% 
+  update_recipe(rec_glm_2)
+
+set.seed(234)
+glm_fit_rs <- glm_wf %>% 
+  fit_resamples(folds, metrics = prob_metrics, control = ctrl)
+
+# Summarized results
+collect_metrics(glm_fit_rs, summarize = TRUE) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
+
+```{r echo=FALSE, eval=FALSE}
+# https://scikit-learn.org/dev/auto_examples/inspection/plot_linear_model_coefficient_interpretation.html
+
+get_coef <- function(x) {
+  tidy(x$.extracts[[1]])
+}
+
+plot_coef <- function(resamples) {
+  map_df(resamples$.extracts, get_coef) %>%
+    ggplot(aes(x = term, y = estimate, size = p.value)) +
+    geom_point() +
+    geom_hline(yintercept = 0, color = "grey30", linetype = 3) +
+    scale_y_continuous(limits = c(-0.4, 0.5)) +
+    coord_flip() +
+    labs(x = "Feature", y = "Coefficient")
+}
+
+plot_coef(glm_fit_rs)
+```
+
+Some variables have non significant coefficients. This means that for this model this variables are not statistically different from 0. With a bit of trial an error, I end up removing 8 variables.
+
+Exist more advanced methods to remove non significant variables than manual checking, such as backwards and forward selection or permutation importance.
+
+```{r glm-preprocess3, echo=TRUE}
+rec_glm_3 <- rec_glm_2 %>% 
+  step_rm(
+    week, feature_4, feature_9, feature_10, feature_12, 
+    feature_14, feature_15, feature_16
+  )
+```
+
+```{r glm-model3}
+# Update the workflow with the new recipe
+glm_wf <- glm_wf %>% 
+  update_recipe(rec_glm_3)
+
+set.seed(234)
+glm_fit_rs <- glm_wf %>% 
+  fit_resamples(folds, metrics = prob_metrics, control = ctrl)
+
+# Summarized results
+collect_metrics(glm_fit_rs, summarize = TRUE) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
+
+As we have seen during the [analysis of weeks worked](#weeks-worked) this feature seems a good candidate to predict if a courier will work in any of the following weeks.
+
+```{r glm-preprocess4, echo=TRUE}
+rec_glm_4 <- 
+  recipe(label ~ ., data = train) %>%
+  update_role(courier, new_role = "id") %>%
+  step_medianimpute(weeks_worked) %>% 
+  step_rm(
+    is_missing, time_to_rest,
+    week, feature_4, feature_9, feature_10, feature_12, 
+    feature_14, feature_15, feature_16
+  ) %>% 
+  step_YeoJohnson(all_numeric()) %>%
+  step_dummy(feature_1_ltv, one_hot = TRUE) %>%
+  step_nzv(all_predictors())
+```
+
+Wow! This feature really increases the metrics of the model.
+
+```{r glm-model4}
+# Update the workflow with the new recipe
+glm_wf <- glm_wf %>% 
+  update_recipe(rec_glm_4)
+
+set.seed(234)
+glm_fit_rs <- glm_wf %>% 
+  fit_resamples(folds, metrics = prob_metrics, control = ctrl)
+
+# Summarized results
+collect_metrics(glm_fit_rs, summarize = TRUE) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
+
+Finally, fit the model using all training data available and make predictions on the test set to evaluate how the model will perform on unseen data.
+
+```{r glm-final-model, echo=TRUE, fig.height=5, fig.width=7}
+# Fit final model on all train data
+final_glm <- glm_wf %>% fit(data = train)
+
+# Plot variable importance
+final_glm %>% 
+  pull_workflow_fit() %>% 
+  vip::vip(num_features = 25) +
+  labs(title = "GLM final model features")
+```
+
+```{r glm-final-predictions, echo=TRUE}
+# Make predictions on the test set
+glm_test_preds <- final_glm %>% 
+  predict(new_data = test, type = "prob") %>% 
+  bind_cols(select(test, label, courier))
+
+glm_test_preds %>%
+  prob_metrics(truth = label, .pred_Churn) %>%
+  to_html(digits = 3, full_width = FALSE)
+```
+
+From this histogram we see that the model is assigning low probability of churn to couriers that will churn. This requires further analysis of the model to understand why this is happening.
+
+```{r glm-analyzing-probs}
+glm_test_preds %>% 
+  group_by(courier, label) %>% 
+  summarise_if(is.numeric, median) %>% 
+  ggplot(aes(.pred_Churn, fill = label)) +
+  geom_histogram() +
+  scale_fill_manual(values = fill_colors)
+```
+
+### Random Forest
+
+Random forest will be the second model to complete this task because they are good "out of the box" learning algorithm that enjoys of good performance. Random forest is an improved version of the bagged trees, because they create multiple *uncorrelated* trees to reduce the variance. In addition, they are simpler than the famous XGBoost, making it easier to tune the parameters and understand what is happening under the hood.
+
+The first random forest will use all the initial features, encoding `feature_1_ltv` with one hot encoding.
+
+```{r rf-model, echo=TRUE}
+rec_rf <- basic_rec %>% 
+  step_dummy(feature_1_ltv, one_hot = FALSE) %>%
+  step_nzv(all_predictors())
+```
+
+```{r rf-show-data, echo=FALSE, eval=FALSE}
+# prep(rec_rf, training = train) %>% juice()
+# tidy(prep(rec_rf, training = train), 6)
+```
+
+```{r rf-model1}
+# Define a model
+rf_spec <- rand_forest(trees = 10, min_n = 3) %>% 
+  set_engine("ranger", importance = "permutation", max.depth = 3) %>% 
+  set_mode("classification")
+
+# Create a workflow
+rf_wf <- workflow() %>% 
+  add_model(rf_spec) %>% 
+  add_recipe(rec_rf)
+
+# Evaluate the model
+set.seed(234)
+rf_fit_rs <- rf_wf %>% 
+  fit_resamples(folds, metrics = prob_metrics, control = ctrl)
+
+# Summarized results
+collect_metrics(rf_fit_rs, summarize = TRUE) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
+
+Again, we evaluate the model removing the same variables than in the Logistic Regression. Removing features does not improve the model, maybe the algorithm is selecting the most important features by itself.
+
+```{r rf-model2, echo=TRUE}
+rec_rf_2 <- basic_rec %>% 
+  step_rm(
+    week, feature_4, feature_9, feature_10, feature_12,
+    feature_14, feature_15, feature_16
+  ) %>% 
+  step_dummy(feature_1_ltv) %>%
+  step_nzv(all_predictors())
+```
+
+```{r rf-results2, echo=FALSE}
+rf_wf <- rf_wf %>% 
+  update_recipe(rec_rf_2)
+
+set.seed(234)
+rf_fit_rs <- rf_wf %>% 
+  fit_resamples(folds, metrics = prob_metrics, control = ctrl)
+
+# Summarized results
+collect_metrics(rf_fit_rs, summarize = TRUE) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
+
+Introducing `weeks_worked` in the model provide a boost in the `roc_auc` going from 0.7 to 0.8.
+
+```{r rf-model3, echo=TRUE}
+rec_rf_3 <- recipe(label ~ ., data = train) %>%
+  update_role(courier, new_role = "id") %>%
+  step_medianimpute(weeks_worked) %>% 
+  step_rm(
+    is_missing, time_to_rest,
+    week, feature_4, feature_9, feature_10, feature_12,
+    feature_14, feature_15, feature_16
+  ) %>% 
+  step_dummy(feature_1_ltv) %>%
+  step_nzv(all_predictors())
+```
+
+```{r rf-results3}
+rf_wf <- rf_wf %>% 
+  update_recipe(rec_rf_3)
+
+set.seed(234)
+rf_fit_rs <- rf_wf %>% 
+  fit_resamples(folds, metrics = prob_metrics, control = ctrl)
+
+# Summarized results
+collect_metrics(rf_fit_rs, summarize = TRUE) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
+
+The last thing that we have left is train the model using all the data available and see how it works in the test data.
+
+```{r rf-final-predictions, echo=TRUE}
+# Fit final model on all train data
+final_rf <- rf_wf %>% fit(data = train)
+
+# Make predictions on the test set
+rf_test_preds <- final_rf %>% 
+  predict(new_data = test, type = "prob") %>% 
+  bind_cols(select(test, label, courier))
+
+rf_test_preds %>%
+  prob_metrics(truth = label, .pred_Churn) %>%
+  to_html(digits = 3, full_width = FALSE)
+```
+
+Again, the model is assigning low probabilities to couriers that will churn.
+
+```{r rf-viz-analyzing-probs}
+rf_test_preds %>% 
+  group_by(courier, label) %>% 
+  summarise_if(is.numeric, median) %>% 
+  ggplot(aes(.pred_Churn, fill = label)) +
+  geom_histogram() +
+  scale_fill_manual(values = fill_colors)
+```
+
+## Hyper parameter tuning
+
+**Finally, tune your hyper-parameters of your model by randomized search, grid search or any other search method and explain your reasoning for this choice.**
+
+The technique used to tune the hyper parameters is the grid search because of it is easy implementation and understanding. This technique creates a grid of parameters and evaluates each of them and select the best one. This is not the best method because as the number of parameters increases the computational time do it as well. The problem of this method is that each iteration is independent and then the information of each *step* does not help to improve the next iteration. Here is where bayesian optimization comes into play.
+
+> To properly tune the hyper parameters of the model a nested *kFold* is needed, as it is explained [here](https://scikit-learn.org/stable/auto_examples/model_selection/plot_nested_cross_validation_iris.html) but for this exercise the parameters will be evaluated using the same folds that we have been using so far.
+
+The following parameters will be tuned:
+
+-   *trees*: number of trees
+-   *mtry*: number of variables to randomly sample as candidates in each split
+-   min_n: number of minimum samples within the terminal nodes. Smaller node size allows for deeper, more complex trees.
+-   *sample.fraction*: number of samples to train on. Lower sample sizes can reduce the training time but may introduce more bias than necessary. Increasing the sample size can increase performance but at the risk of overfitting.
+
+```{r prepare-grid-spec}
+rf_spec <- rand_forest(
+  mtry = tune(), 
+  trees = tune(), 
+  min_n = tune(), 
+  mode = "classification"
+  ) %>% 
+  set_engine(
+    engine = "ranger", 
+    importance = "permutation", 
+    max.depth = 3, 
+    sample.fraction = 0.9
+  )
+```
+
+```{r create-grid-values, echo=TRUE}
+rf_grid <- crossing(
+  mtry = c(3, 5, 7, 9),
+  trees = c(10, 15, 20),
+  min_n = c(10, 15, 20)
+  # max.depth = seq(3, 5, 2),
+  # sample.fraction = c(0.9, 1)
+)
+```
+
+This grid has `r ncol(rf_grid)` parameters and `r nrow(rf_grid)` combinations to tune.
+
+```{r run-tunning, echo=TRUE}
+# Create workflow
+rf_grid_wf <- workflow() %>%
+  add_model(rf_spec) %>% 
+  add_recipe(rec_rf_3)
+
+# Use parallelization to speed-up calculations
+# cl <- parallel::makeCluster(2)
+cl <- parallel::makePSOCKcluster(2)
+doParallel::registerDoParallel(cl = cl)
+
+# Seach for the best parameters
+set.seed(234)
+rf_grid_res <- tune_grid(
+  rf_grid_wf,
+  resamples = folds,
+  grid = rf_grid,
+  metrics = prob_metrics,
+  control = control_grid(save_pred = TRUE)
+)
+parallel::stopCluster(cl)
+```
+
+Following are the parameters as well as the metrics for the best model found during the grid search
+
+```{r show-best-results, echo=TRUE, eval=TRUE}
+# Show results of grid search
+show_best(rf_grid_res, "roc_auc", n = 1) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
+
+```{r best-grid-params}
+# Store params of the best model found
+best_auc <- select_best(rf_grid_res, "roc_auc")
+```
+
+```{r fit-final-grid-model}
+final_grid_rf <- finalize_workflow(rf_grid_wf, best_auc) %>% 
+  fit(data = train)
+```
+
+Feature importance for the best grid model
+
+```{r grid-fi, fig.height=5, fig.width=6}
+final_grid_rf %>%
+  pull_workflow_fit() %>%
+  vip::vip()
+```
+
+Make predictions on the test set and show the performance
+
+```{r grid-preds}
+grid_rf_test_preds <- final_grid_rf %>% 
+  predict(new_data = test, type = "prob") %>% 
+  bind_cols(select(test, courier, label))
+
+grid_rf_test_preds %>% 
+  prob_metrics(truth = label, .pred_Churn) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
+
+## Compare models
+
+On the left side we have the `roc_auc` curve and on the right side the `pr_auc` curve. During this project it has been chosen the `roc_auc` as our main metric and the `pr_auc` as a complementary and will see why in a moment.
+
+The `roc_auc` is a trade-off between the $TPR$ and $FPR$. As much on the upper left corner it is the curve the best is the model because it means that the model is able to detect the true positive cases of the dataset (y-axis) and making few errors on the false positives cases (x-axis). All the three models have similar curves, but the `RF Tunned` has the best one (because it has bigger area under the curve).
+
+$$TPR = \frac{TP}{TP + FN}$$
+
+$$FPR  = \frac{FP}{FP + TN}$$
+
+When dealing with imbalanced datasets, with a high number of negatives cases (0's) the `roc_auc` can be a bit optimistic because of the true negatives in the FPR. In that case, it is a good practice use the `precision-recall` curve.
+
+The precision-recall curve show us the relationship between the precision and recall. Let's explain what does this terms mean:
+
+The *recall* is the ability of a model to identify **all the positive cases within the dataset**. In this case true positive are couriers that will Churn and the model has identified as 1, and false negatives are couriers that the model has identified as Non_Churn but will actually Churn. A model that predicts always the positive label, Churn in this case, will have a recall of 1 because it will capture all the positive cases. But a model that always predicts the positive class will not be useful, and will have a low *precision*. Then, *precision* measures the ability of the model to **identify only the relevant cases**.
+
+$$recall = \frac{TP}{TP + FN}$$
+
+$$precision  = \frac{TP}{TP + FP}$$
+
+```{r viz-plot-roc-precision-recall, fig.height=4, fig.width=8}
+glm_test_preds     <- mutate(glm_test_preds, model = "GLM")
+rf_test_preds      <- mutate(rf_test_preds, model = "RF")
+grid_rf_test_preds <- mutate(grid_rf_test_preds, model = "RF Tunned")
+
+lvls <- c("GLM", "RF", "RF Tunned")
+p1 <- 
+  bind_rows(glm_test_preds, rf_test_preds, grid_rf_test_preds) %>% 
+  mutate(model = factor(model, levels = lvls)) %>%
+  group_by(model) %>% 
+  roc_curve(label, .pred_Churn) %>% 
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = model)) + 
+  geom_path(lwd = 1) +
+  geom_abline(lty = 3) +
+  coord_equal() +
+  scale_color_brewer(palette = "Dark2", direction = -1) +
+  theme(legend.position = "top") +
+  labs(x = "FPR (1 - specificity)", y = "TPR (sensitivity)")
+
+p2 <- 
+  bind_rows(glm_test_preds, rf_test_preds, grid_rf_test_preds) %>% 
+  mutate(model = factor(model, levels = lvls)) %>%
+  group_by(model) %>% 
+  pr_curve(label, .pred_Churn) %>% 
+  ggplot(aes(x = recall, y = precision, color = model)) + 
+  geom_path(lwd = 1) +
+  geom_abline(lty = 3, slope = -1, intercept = 1) +
+  coord_equal() +
+  scale_color_brewer(palette = "Dark2", direction = -1) +
+  theme(legend.position = "top")
+
+p1 + p2
+```
+
+```{r expot_img_model_performance}
+ggsave(filename = file.path("../figures", "model_performance.png"), 
+       width = 8, height = 6)
+```
+
+The precision-recall curve is showing us more differences between the models. The random forest without tuning has a big drop off as soon as it starts predicting positive cases. However, the glm and the random forest tuned hold better in the upper part of the graph.
+
+So far we have been evaluating our model but how it will impact in our business? With the gain curve we can target our users given their probabilities of churn. We can interpret the following graph as if we would reach 50% of the couriers we will found \~ 75% of the Churn cases.
+
+```{r viz-gain-curve}
+grid_rf_test_preds %>% 
+  group_by(courier, label) %>% 
+  summarise_if(is.numeric, mean) %>% 
+  ungroup() %>% 
+  gain_curve(label, .pred_Churn) %>% 
+  autoplot()
+```
+
+### Threshold Optimization
+
+Now that we have the model and the probabilities we must decide which threshold we are going to use to decide whether a courier will leave or stay. In many occasions we use the F1 score to find that threshold, however, when the cost of the FP and the FN is different this metric is not valid.
+
+In order to attach business value to this problem, let us make the following assumptions:
+
+- Time an efforts spent in chasing prioritized couriers 10€ (true positive + false positive). This cost can also include the time that the manager has to spend talking to the courier to try to get him/her to stay or identify what's going wrong
+- If we were able to stop the churn, we will gain 25€, on average, in courier life time value. (true positive)
+- Opportunities missed by the model 10€ (false negatives). This cost includes having to find new couriers, spending time from HR, providing material to new employees, learning how everything works, training on the tools to use, etc.
+
+```{r best-threshold-optimization}
+# Create range of thresholds
+rng_thr <- with(
+  grid_rf_test_preds, 
+  seq(min(.pred_Churn), max(.pred_Churn), length.out = 25)
+)
+
+# Aggregate predictions by courier
+preds_by_courier <- grid_rf_test_preds %>% 
+  group_by(courier, label, model) %>% 
+  summarise_if(is.numeric, mean) %>% 
+  ungroup() %>% 
+  left_join(
+    distinct(weekly_data_imputed, courier, feature_2_ltv), 
+    by = "courier"
+  )
+
+# Add thresholds to the data frame
+class_df <- 
+  map_df(rng_thr, ~ preds_by_courier %>% 
+  mutate(threshold = .x))
+```
+
+```{r define-cost-function, echo=TRUE}
+# Define cost function
+cost_func <- function(tp, fp, fn, tn) {
+  COST_FP <- -10      # time and efforts spend (tp + fp)
+  COST_FN <- -10      # opportunity cost
+  COST_TP <- 25 - 10  # profit - investment
+  COST_TN <- 0
+  tp * COST_TP + fp * COST_FP + fn * COST_FN + tn * COST_TN
+}
+
+cost_func_2 <- function(tp, fp, fn, tn) {
+  COST_FP <- -10      # time and efforts spend (tp + fp)
+  COST_FN <- 0        # opportunity cost.
+  COST_TP <- 25 - 10  # profit - investment
+  COST_TN <- 0
+  tp * COST_TP + fp * COST_FP + fn * COST_FN + tn * COST_TN
+}
+
+# Calculate metrics for different thresholds
+rates <- class_df %>% 
+  group_by(threshold) %>% 
+  summarise(
+    TP = sum(.pred_Churn > threshold & label == "Churn"),
+    FP = sum(.pred_Churn > threshold & label == "Non_Churn"),
+    FN = sum(.pred_Churn < threshold & label == "Churn"),
+    TN = sum(.pred_Churn < threshold & label == "Non_Churn")
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    cost_policy_1 = pmap_dbl(
+      .l = list(TP, FP, FN, TN),
+      .f = cost_func
+    ), 
+    cost_policy_2 = pmap_dbl(
+      .l = list(TP, FP, FN, TN),
+      .f = cost_func_2
+    )
+  )
+```
+
+For completeness, another scenario has been simulated, where the opportunity (false negatives) costs are not included. Everything else remains the same.
+
+In blue we have the first scenario, the one that includes opportunity costs. In orange, the second one, without opportunity costs.
+
+```{r viz-cost-function}
+v_line_1 <- with(rates, threshold[max(cost_policy_1) == cost_policy_1])
+v_line_2 <- with(rates, threshold[max(cost_policy_2) == cost_policy_2])
+
+rates %>% 
+  ggplot(aes(x = threshold)) +
+  # Policy 1 = blue
+  geom_point(aes(y = cost_policy_1), color = "#00798c", size = 2.5) +
+  geom_line(aes(y = cost_policy_1), color = "#00798c", 
+            size = 1.5, alpha = 0.6) +
+  # Policy 2 = orange
+  geom_point(aes(y = cost_policy_2), color = "#edae49", size = 2.5) +
+  geom_line(aes(y = cost_policy_2), color = "#edae49", 
+            size = 1.5, alpha = 0.6) +
+  # Vertical lines with optimal thresholds
+  geom_vline(xintercept = v_line_1, linetype = 2, 
+             color = "#00798c", alpha = 0.6) +
+  geom_vline(xintercept = v_line_2, linetype = 2, 
+             color = "#edae49", alpha = 0.6) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(
+    labels = scales::dollar_format(prefix = "", suffix = "€"), 
+    limits = c(NA, 6000)
+  ) +
+  labs(
+    title = "Threshold optimization", 
+    subtitle = "Policy_1 in blue and Policy_2 in orange",
+    # subtitle = "In red FP=FN, In black FN = 2*FP",
+    # subtitle = "FP cost -10€ and FN -20€",
+    x = "Threshold", y = "Profit (€)"
+  )
+```
+
+```{r expot_img_threshold_optimization}
+ggsave(filename = file.path("../figures", "threshold_optimization.png"), 
+       width = 8, height = 6)
+```
+
+```{r}
+# # Calculate tp, fp, tn and fn
+# class_metrics <- metric_set(
+#   yardstick::f_meas, 
+#   yardstick::sensitivity, yardstick::specificity,
+#   yardstick::precision, yardstick::recall 
+# )
+```
+
+```{r, fig.height=5}
+# # Visualize metrics
+# rates %>% 
+#   pivot_longer(cols = tpr:fpr, names_to = "key", values_to = "value") %>% 
+#   mutate(
+#     key = fct_reorder2(key, threshold, value),
+#     group = if_else(key %in% c("tpr", "fnr"), "Group 1", "Group 2")
+#   ) %>% 
+#   ggplot(aes(x = threshold, y = value, color = key)) +
+#   geom_point() +
+#   geom_smooth(se = FALSE) +
+#   scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+#   theme(legend.position = "bottom") +
+#   facet_wrap(~ group) +
+#   labs(title = "Expected Rates", x = "Threshold", y = "Value")
+```
+
+## Post-Processing
+
+Suppose that our target to classify Churn cases is 0.3. What would happen in this scenario? Would we label it as Churn or a Non_Churn? Remember that we are predicting if a courier will work in any of the following weeks, not if a courier will work in a specific week.
+
+```{r example-predictions}
+grid_rf_test_preds %>% 
+  filter(courier == "107223") %>% 
+  to_html(digits = 2, full_width = FALSE)
+```
+
+To solve this problem we have two options. If any of the weeks the probability of working is high we can say that this courier will continue with us, or we can take the average of all the predictions.
+
+```{r example-predictions-agg}
+grid_rf_test_preds %>% 
+  filter(courier == "107223") %>% 
+  group_by(courier, label) %>% 
+  summarise_if(is.numeric, mean) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
+
+How this post-processing affects the metrics? In this case only increases a bit.
+
+```{r post-processing-predictions}
+# Boosting predictions!
+grid_rf_test_preds %>% 
+  group_by(courier, label) %>% 
+  summarise_if(is.numeric, mean) %>% 
+  ungroup() %>% 
+  prob_metrics(truth = label, .pred_Churn) %>% 
+  to_html(digits = 3, full_width = FALSE)
+```
