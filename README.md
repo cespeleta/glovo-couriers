@@ -33,7 +33,7 @@ From a business perspective, the retention rate might be an interesting measure 
 We have created two models (glm and random forest) to predict the likelihood of stay or leave of the couriers. Then, we look for the best hyper-parameter of this model.
 
 <p align="center">
-  <img src="figures/model_performance.png" alt="Model performane" width="700" height="500" />
+  <img src="figures/model_performance.png" alt="Model performane" width="800" height="400" />
 </p>
 
 Once the model is chosen, an small business case is carried out to justify the selection of the target and see what's the impact of the model.
